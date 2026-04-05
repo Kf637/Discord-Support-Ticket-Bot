@@ -1,0 +1,21 @@
+{
+  "name": "sl-support-bot",
+  "version": "1.0.0",
+  "description": "Discord support ticket bot with button + modal flow",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "support",
+    "tickets"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "sqlite3": "^5.1.7"
+  }
+}
