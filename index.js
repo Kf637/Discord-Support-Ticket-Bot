@@ -303,19 +303,6 @@ function validateAndSanitizeInput(value, fieldLabel, isRequired) {
   return sanitized.length > 0 ? sanitized : null;
 }
 
-function parseJsonObject(jsonValue) {
-  try {
-    const parsed = JSON.parse(jsonValue);
-    if (parsed && typeof parsed === "object") {
-      return parsed;
-    }
-
-    return {};
-  } catch {
-    return {};
-  }
-}
-
 function formatTimestampForFilename(isoTimestamp) {
   return isoTimestamp.replace(/[:.]/g, "-");
 }
@@ -375,20 +362,13 @@ function formatMessageForTranscript(message) {
   return lines.join("\n");
 }
 
-async function createTicketTranscript(channel, openTicket, closedByUserId) {
+async function createTicketTranscript(channel, openTicket) {
   const closedAt = new Date().toISOString();
-  const createdInfo = parseJsonObject(openTicket.info);
   const allMessages = await fetchAllChannelMessages(channel);
 
   const transcriptLines = [
     `Ticket ID: ${openTicket.ticket_id}`,
-    `Opened by: <@${openTicket.discord_user_id}> (${openTicket.discord_user_id})`,
-    `Closed by: <@${closedByUserId}> (${closedByUserId})`,
-    `Timestamp of ticket creation: ${openTicket.created_at}`,
-    `Timestamp of ticket closing: ${closedAt}`,
-    "",
-    "Created info:",
-    JSON.stringify(createdInfo, null, 2),
+    `Transcript generated at (UTC): ${closedAt}`,
     "",
     "Messages:",
     "==================================================",
@@ -865,11 +845,7 @@ client.on("interactionCreate", async (interaction) => {
         ),
       };
 
-      const transcriptResult = await createTicketTranscript(
-        interaction.channel,
-        openTicket,
-        interaction.user.id
-      );
+      const transcriptResult = await createTicketTranscript(interaction.channel, openTicket);
 
       await sendTranscriptToLogs(
         interaction.guild,
