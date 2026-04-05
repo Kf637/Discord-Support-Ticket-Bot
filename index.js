@@ -745,6 +745,17 @@ client.once("clientReady", async () => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton() && interaction.customId === CUSTOM_IDS.OPEN_TICKET_BUTTON) {
+      if (oneOpenTicketPerUserEnabled) {
+        const existingTicket = await findExistingOpenTicketForUser(interaction.user.id);
+        if (existingTicket) {
+          await interaction.reply({
+            content: "You already have an open ticket",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+      }
+
       await interaction.showModal(buildTicketModal());
       return;
     }
