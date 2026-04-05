@@ -71,11 +71,10 @@ npm start
 
 - Transcript file includes:
   - Ticket ID
-  - Opened by
-  - Closed by
-  - Creation/closing timestamps
-  - Created info JSON
+  - Date/time format legend at the top: `DD-MM-YYYY HH:MM (24-hour UTC)`
+  - Transcript generated timestamp
   - Full channel message history
+- Message timestamps are formatted as `DD-MM-YYYY HH:MM` (24-hour UTC).
 - Transcript file does not include created/closed reason lines.
 - Log embed in `TRANSCRIPTS_CHANNEL_ID` includes created/closed reasons.
 

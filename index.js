@@ -307,6 +307,17 @@ function formatTimestampForFilename(isoTimestamp) {
   return isoTimestamp.replace(/[:.]/g, "-");
 }
 
+function formatUtcDateTime(dateInput) {
+  const date = new Date(dateInput);
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const year = date.getUTCFullYear();
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+
+  return `${day}-${month}-${year} ${hours}:${minutes}`;
+}
+
 async function fetchAllChannelMessages(channel) {
   const allMessages = [];
   let before;
@@ -333,7 +344,7 @@ async function fetchAllChannelMessages(channel) {
 }
 
 function formatMessageForTranscript(message) {
-  const timestamp = new Date(message.createdTimestamp).toISOString();
+  const timestamp = formatUtcDateTime(message.createdTimestamp);
   const authorTag = message.author ? `${message.author.tag} (${message.author.id})` : "Unknown";
   const messageContent = message.content ? message.content.replace(/\r/g, "") : "[no text content]";
 
@@ -364,11 +375,13 @@ function formatMessageForTranscript(message) {
 
 async function createTicketTranscript(channel, openTicket) {
   const closedAt = new Date().toISOString();
+  const closedAtFormatted = formatUtcDateTime(closedAt);
   const allMessages = await fetchAllChannelMessages(channel);
 
   const transcriptLines = [
     `Ticket ID: ${openTicket.ticket_id}`,
-    `Transcript generated at (UTC): ${closedAt}`,
+    "Date and time format: DD-MM-YYYY HH:MM (24-hour UTC)",
+    `Transcript generated at: ${closedAtFormatted}`,
     "",
     "Messages:",
     "==================================================",
@@ -671,7 +684,7 @@ async function createTicketChannel(interaction, answers) {
     name: ticketName,
     type: ChannelType.GuildText,
     parent: TICKET_CATEGORY_ID,
-    topic: `Ticket ${code} | ticket-owner:${interaction.user.id}`,
+    topic: `Ticket Owner: ${interaction.user.id}`,
     permissionOverwrites,
   });
 
