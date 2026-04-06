@@ -42,6 +42,7 @@ const {
   ONE_OPEN_TICKET_PER_USER,
   DM_TRANSCRIPT_USER_ON_TICKET_CLOSE,
   AUTO_DELETE_TRANSCRIPTS,
+  BLACKLIST_USAGE_ALLOWED_ROLEID,
 } = process.env;
 
 function parseBooleanEnv(value, defaultValue = true) {
@@ -68,13 +69,30 @@ const dmTranscriptUserOnTicketCloseEnabled = parseBooleanEnv(
   false
 );
 const autoDeleteTranscriptsEnabled = parseBooleanEnv(AUTO_DELETE_TRANSCRIPTS, false);
+const supportRoleId = String(SUPPORT_ROLE_ID || "").trim() || null;
+let hasLoggedSupportRoleAdminFallback = false;
 
 const DATA_DIRECTORY = path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIRECTORY, "tickets.db");
+const DB_PATH = path.join(DATA_DIRECTORY, "data.db");
+const LEGACY_DB_PATH = path.join(DATA_DIRECTORY, "tickets.db");
 const TRANSCRIPTS_DIRECTORY = path.join(DATA_DIRECTORY, "transcripts");
 
 fs.mkdirSync(DATA_DIRECTORY, { recursive: true });
 fs.mkdirSync(TRANSCRIPTS_DIRECTORY, { recursive: true });
+
+function migrateLegacyDatabasePath() {
+  // One-time rename for older installs that still use tickets.db.
+  if (!fs.existsSync(DB_PATH) && fs.existsSync(LEGACY_DB_PATH)) {
+    try {
+      fs.renameSync(LEGACY_DB_PATH, DB_PATH);
+      console.log("Migrated legacy database file from tickets.db to data.db");
+    } catch (error) {
+      console.warn("Could not migrate legacy database file automatically:", error);
+    }
+  }
+}
+
+migrateLegacyDatabasePath();
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -118,6 +136,7 @@ function dbAll(sql, params = []) {
 }
 
 async function ensureClosedTicketsSchema() {
+  // Runtime schema check keeps existing databases compatible after new columns are introduced.
   const columns = await dbAll("PRAGMA table_info(closed_tickets)");
   const hasMessageLinkColumn = columns.some(
     (column) => column && column.name === "link_to_discord_message"
@@ -153,6 +172,16 @@ async function initializeDatabase() {
     )
   `);
 
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS blacklisted (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      discord_user_id TEXT NOT NULL UNIQUE,
+      reason TEXT NOT NULL,
+      blacklisted_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+
   await ensureClosedTicketsSchema();
 }
 
@@ -168,12 +197,14 @@ const CUSTOM_IDS = {
 };
 
 const ticketShowCommand = require("./commands/ticketshow");
+const blacklistCommand = require("./commands/blacklist");
 
-const SLASH_COMMANDS = [ticketShowCommand];
+const SLASH_COMMANDS = [ticketShowCommand, blacklistCommand];
 const SLASH_COMMANDS_BY_NAME = new Map(
   SLASH_COMMANDS.map((command) => [command.data.name, command])
 );
 
+// Lightweight pattern guard for modal text; SQL parameters are still used for DB writes.
 const SQL_INJECTION_PATTERN =
   /(--|\/\*|\*\/|;\s*(drop|alter|truncate|insert|delete|update|select|union|create|grant|revoke)\b|\bunion\s+select\b|\bor\s+1\s*=\s*1|\band\s+1\s*=\s*1)/i;
 
@@ -223,6 +254,7 @@ async function ticketIdExists(ticketId) {
 }
 
 async function generateUniqueTicketCode(maxAttempts = 50) {
+  // Hard cap avoids an infinite loop if the ID space gets crowded.
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const candidateCode = generateTicketCode();
     const exists = await ticketIdExists(candidateCode);
@@ -358,6 +390,7 @@ async function fetchAllChannelMessages(channel) {
   const allMessages = [];
   let before;
 
+  // Pull messages in batches, then reverse once to get chronological transcript output.
   while (true) {
     const batch = await channel.messages.fetch({
       limit: 100,
@@ -589,6 +622,29 @@ async function findExistingOpenTicketForUser(userId) {
   return openTicket;
 }
 
+function formatBlacklistReason(reason) {
+  const normalizedReason = sanitizeTicketInput(String(reason || ""));
+  if (!normalizedReason) {
+    return "No reason provided.";
+  }
+
+  return normalizedReason.length > 400
+    ? `${normalizedReason.slice(0, 397)}...`
+    : normalizedReason;
+}
+
+async function getBlacklistEntryForUser(userId) {
+  return dbGet(
+    `
+      SELECT reason
+      FROM blacklisted
+      WHERE discord_user_id = ?
+      LIMIT 1
+    `,
+    [userId]
+  );
+}
+
 async function getOpenTicketByChannel(channelId) {
   return dbGet(
     `
@@ -602,15 +658,41 @@ async function getOpenTicketByChannel(channelId) {
 }
 
 async function memberHasSupportRole(interaction) {
-  if (!interaction.inGuild() || !SUPPORT_ROLE_ID) {
+  if (!interaction.inGuild()) {
     return false;
   }
 
   try {
     const member = await interaction.guild.members.fetch(interaction.user.id);
-    return member.roles.cache.has(SUPPORT_ROLE_ID);
+
+    if (!supportRoleId) {
+      if (!hasLoggedSupportRoleAdminFallback) {
+        console.log(
+          "SUPPORT_ROLE_ID is empty or not configured in .env. Falling back to Discord Administrator permission checks."
+        );
+        hasLoggedSupportRoleAdminFallback = true;
+      }
+
+      return member.permissions.has(PermissionFlagsBits.Administrator);
+    }
+
+    return member.roles.cache.has(supportRoleId);
   } catch (error) {
     console.error("Failed to verify support role:", error);
+    return false;
+  }
+}
+
+async function memberHasRole(interaction, roleId) {
+  if (!interaction.inGuild() || !roleId) {
+    return false;
+  }
+
+  try {
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    return member.roles.cache.has(roleId);
+  } catch (error) {
+    console.error("Failed to verify role:", error);
     return false;
   }
 }
@@ -629,6 +711,7 @@ async function moveTicketToClosed(
 
   const closedAt = closedAtIsoTimestamp || new Date().toISOString();
 
+  // Keep insert+delete atomic so tickets never exist in both tables after close.
   await dbRun("BEGIN TRANSACTION");
 
   try {
@@ -680,6 +763,7 @@ async function resolvePanelChannel() {
 async function hasExistingPanelMessage(channel) {
   const recentMessages = await channel.messages.fetch({ limit: 25 });
 
+  // Avoid posting duplicate panels every time the bot restarts.
   return recentMessages.some(
     (message) =>
       message.author.id === client.user.id &&
@@ -717,6 +801,7 @@ async function createTicketChannel(interaction, answers) {
   const code = await generateUniqueTicketCode();
   const ticketName = `ticket-${code.toLowerCase()}`;
 
+  // Default to private: owner + bot, then optionally add support role access.
   const permissionOverwrites = [
     {
       id: interaction.guild.roles.everyone.id,
@@ -742,9 +827,9 @@ async function createTicketChannel(interaction, answers) {
     },
   ];
 
-  if (SUPPORT_ROLE_ID) {
+  if (supportRoleId) {
     permissionOverwrites.push({
-      id: SUPPORT_ROLE_ID,
+      id: supportRoleId,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
@@ -794,7 +879,7 @@ async function createTicketChannel(interaction, answers) {
     )
     .setTimestamp();
 
-  const supportMention = SUPPORT_ROLE_ID ? `<@&${SUPPORT_ROLE_ID}>` : "Support Team";
+  const supportMention = supportRoleId ? `<@&${supportRoleId}>` : "Support Team";
 
   await channel.send({
     content: `${interaction.user} opened this ticket. ${supportMention}`,
@@ -807,6 +892,13 @@ async function createTicketChannel(interaction, answers) {
 
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  if (!supportRoleId && !hasLoggedSupportRoleAdminFallback) {
+    console.log(
+      "SUPPORT_ROLE_ID is empty or not configured in .env. Falling back to Discord Administrator permission checks."
+    );
+    hasLoggedSupportRoleAdminFallback = true;
+  }
 
   try {
     await registerSlashCommands();
@@ -824,11 +916,15 @@ client.once("clientReady", async () => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      // Central command dispatcher; each module gets shared helpers via context.
       const command = SLASH_COMMANDS_BY_NAME.get(interaction.commandName);
       if (command) {
         await command.execute(interaction, {
-          SUPPORT_ROLE_ID,
+          SUPPORT_ROLE_ID: supportRoleId,
+          BLACKLIST_USAGE_ALLOWED_ROLEID,
           memberHasSupportRole,
+          memberHasRole,
+          dbRun,
           dbGet,
           dbAll,
         });
@@ -841,7 +937,7 @@ client.on("interactionCreate", async (interaction) => {
       ticketShowCommand.isPaginationButtonCustomId(interaction.customId)
     ) {
       const handled = await ticketShowCommand.handlePaginationButton(interaction, {
-        SUPPORT_ROLE_ID,
+        SUPPORT_ROLE_ID: supportRoleId,
         memberHasSupportRole,
         dbGet,
         dbAll,
@@ -853,6 +949,15 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId === CUSTOM_IDS.OPEN_TICKET_BUTTON) {
+      const blacklistEntry = await getBlacklistEntryForUser(interaction.user.id);
+      if (blacklistEntry) {
+        await interaction.reply({
+          content: `You are blacklisted from opening tickets.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       if (oneOpenTicketPerUserEnabled) {
         const existingTicket = await findExistingOpenTicketForUser(interaction.user.id);
         if (existingTicket) {
@@ -869,14 +974,6 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId === CUSTOM_IDS.CLOSE_TICKET_BUTTON) {
-      if (!SUPPORT_ROLE_ID) {
-        await interaction.reply({
-          content: "SUPPORT_ROLE_ID is not configured in .env.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-
       const openTicket = await getOpenTicketByChannel(interaction.channelId);
       if (!openTicket) {
         await interaction.reply({
@@ -901,6 +998,14 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId === CUSTOM_IDS.TICKET_MODAL) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const blacklistEntry = await getBlacklistEntryForUser(interaction.user.id);
+      if (blacklistEntry) {
+        await interaction.editReply(
+          `You are blacklisted from opening tickets.\nReason: ${formatBlacklistReason(blacklistEntry.reason)}`
+        );
+        return;
+      }
 
       const categoryChannel =
         interaction.guild.channels.cache.get(TICKET_CATEGORY_ID) ||
@@ -946,11 +1051,6 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId === CUSTOM_IDS.CLOSE_TICKET_MODAL) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-      if (!SUPPORT_ROLE_ID) {
-        await interaction.editReply("SUPPORT_ROLE_ID is not configured in .env.");
-        return;
-      }
 
       const hasSupportRole = await memberHasSupportRole(interaction);
       if (!hasSupportRole) {
@@ -1018,6 +1118,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.channel.delete(`Ticket ${closedTicket.ticketId} closed by support staff`);
         return;
       } finally {
+        // Cleanup runs even when close flow errors after transcript creation.
         await maybeDeleteTranscriptFile(transcriptResult.transcriptPath);
       }
     }

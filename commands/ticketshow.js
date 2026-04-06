@@ -22,6 +22,7 @@ const data = new SlashCommandBuilder()
 
 function parseUserIdFromInput(userInput) {
 	const value = String(userInput).trim();
+	// Accept either a mention or a raw user ID so staff can paste whichever they have.
 	const mentionMatch = value.match(/^<@!?(\d+)>$/);
 
 	if (mentionMatch) {
@@ -41,6 +42,7 @@ function buildPageButtonCustomId(targetUserId, page, requesterUserId) {
 
 function parsePageButtonCustomId(customId) {
 	const parts = String(customId).split(":");
+	// Validate every segment; button custom IDs can be edited client-side.
 	if (parts.length !== 4 || parts[0] !== PAGINATION_CUSTOM_ID_PREFIX) {
 		return null;
 	}
@@ -82,6 +84,7 @@ async function getClosedTicketsPage(dbGet, dbAll, discordUserId, requestedPage) 
 
 	const totalTickets = Number(countRow?.count || 0);
 	const totalPages = totalTickets > 0 ? Math.ceil(totalTickets / PAGE_SIZE) : 1;
+	// Clamp page to avoid invalid offsets when users spam old buttons.
 	const safePage = Math.max(0, Math.min(requestedPage, totalPages - 1));
 
 	if (totalTickets === 0) {
@@ -201,6 +204,7 @@ async function renderTicketPage(interaction, context, targetUserId, page, mode, 
 	const paginationRow = buildPaginationRow(targetUserId, safePage, totalPages, requesterUserId);
 	const payload = paginationRow ? { embeds: [embed], components: [paginationRow] } : { embeds: [embed], components: [] };
 
+	// Initial slash command uses editReply; pagination buttons must use update.
 	if (mode === "edit") {
 		await interaction.editReply(payload);
 		return;
@@ -212,14 +216,9 @@ async function renderTicketPage(interaction, context, targetUserId, page, mode, 
 }
 
 async function execute(interaction, context) {
-	const { SUPPORT_ROLE_ID, memberHasSupportRole } = context;
+	const { memberHasSupportRole } = context;
 
 	await interaction.deferReply();
-
-	if (!SUPPORT_ROLE_ID) {
-		await interaction.editReply("SUPPORT_ROLE_ID is not configured in .env.");
-		return;
-	}
 
 	const hasSupportRole = await memberHasSupportRole(interaction);
 	if (!hasSupportRole) {
@@ -241,18 +240,11 @@ async function execute(interaction, context) {
 }
 
 async function handlePaginationButton(interaction, context) {
-	const { SUPPORT_ROLE_ID, memberHasSupportRole } = context;
+	const { memberHasSupportRole } = context;
 	const parsed = parsePageButtonCustomId(interaction.customId);
 
 	if (!parsed) {
 		return false;
-	}
-
-	if (!SUPPORT_ROLE_ID) {
-		await interaction.reply({
-			content: "SUPPORT_ROLE_ID is not configured in .env.",
-		});
-		return true;
 	}
 
 	const hasSupportRole = await memberHasSupportRole(interaction);
@@ -264,6 +256,7 @@ async function handlePaginationButton(interaction, context) {
 	}
 
 	if (parsed.requesterUserId !== interaction.user.id) {
+		// Keep pagination bound to the original requester to avoid cross-user hijacking.
 		await interaction.reply({
 			content: "Only the user who ran /ticketshow can use these buttons.",
 		});
