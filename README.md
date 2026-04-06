@@ -20,8 +20,10 @@ When a user submits the ticket form, the bot creates a private ticket channel, s
 - Stores transcripts in `data/transcripts`
 - Sends close logs + transcript attachment to `TRANSCRIPTS_CHANNEL_ID`
 - Optional transcript DM to ticket owner on close (`DM_TRANSCRIPT_USER_ON_TICKET_CLOSE`)
+- Optional auto-delete of local transcript files (`AUTO_DELETE_TRANSCRIPTS`)
 - SQLite persistence for open/closed tickets in `data/tickets.db`
 - SQL-pattern input sanitization for ticket and close modal inputs
+- Staff slash command `/ticketshow user:<@user|userID>` to view a user's closed tickets
 
 ## Requirements
 
@@ -47,6 +49,7 @@ Create `.env` from `.env.example` and set:
 - `SUPPORT_ROLE_ID` (required for close-ticket permissions)
 - `ONE_OPEN_TICKET_PER_USER` (optional, default: `true`)
 - `DM_TRANSCRIPT_USER_ON_TICKET_CLOSE` (optional, default: `false`)
+- `AUTO_DELETE_TRANSCRIPTS` (optional, default: `false`)
 
 ## Install and Run
 
@@ -66,6 +69,18 @@ npm start
 7. Bot sends close embed + transcript file to `TRANSCRIPTS_CHANNEL_ID`.
 8. Bot optionally DMs transcript file to ticket owner.
 9. Bot moves record from `open_tickets` to `closed_tickets` and deletes channel.
+
+## Staff Slash Command
+
+- Command: `/ticketshow user:<@user|userID>`
+- Access: users with `SUPPORT_ROLE_ID` only
+- Input: accepts either a user mention (for example `<@123...>`) or a raw Discord user ID
+- Output: embed response listing closed tickets for that user from `closed_tickets`, including:
+  - `ticket_id`
+  - `link_to_discord_message` (or no message link when unavailable)
+- Pagination: when more than 20 tickets exist, results are shown 20 per page with **Previous/Next** buttons (single page shown at a time).
+
+The bot auto-registers slash commands in connected guilds on startup.
 
 ## Transcript Notes
 
@@ -98,9 +113,11 @@ Database path: `data/tickets.db`
 - `info` (JSON: `createdReason`, `closedReason`)
 - `created_at`
 - `closed_at`
+- `link_to_discord_message` (URL of the transcript/log message posted in `TRANSCRIPTS_CHANNEL_ID`, or `null` if unavailable)
 
 ## Operational Notes
 
 - Ticket channel names are lowercase (`ticket-xxxxxx`) due to Discord naming rules.
 - If `ONE_OPEN_TICKET_PER_USER=true`, users can only have one active ticket at a time.
 - If transcript DM fails, ticket closing continues and server logs/transcripts are still produced.
+- If `AUTO_DELETE_TRANSCRIPTS=true`, local transcript files in `data/transcripts` are deleted automatically after close flow finishes.

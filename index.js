@@ -41,6 +41,7 @@ const {
   TRANSCRIPTS_CHANNEL_ID,
   ONE_OPEN_TICKET_PER_USER,
   DM_TRANSCRIPT_USER_ON_TICKET_CLOSE,
+  AUTO_DELETE_TRANSCRIPTS,
 } = process.env;
 
 function parseBooleanEnv(value, defaultValue = true) {
@@ -66,6 +67,7 @@ const dmTranscriptUserOnTicketCloseEnabled = parseBooleanEnv(
   DM_TRANSCRIPT_USER_ON_TICKET_CLOSE,
   false
 );
+const autoDeleteTranscriptsEnabled = parseBooleanEnv(AUTO_DELETE_TRANSCRIPTS, false);
 
 const DATA_DIRECTORY = path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIRECTORY, "tickets.db");
@@ -102,6 +104,30 @@ function dbGet(sql, params = []) {
   });
 }
 
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(rows || []);
+    });
+  });
+}
+
+async function ensureClosedTicketsSchema() {
+  const columns = await dbAll("PRAGMA table_info(closed_tickets)");
+  const hasMessageLinkColumn = columns.some(
+    (column) => column && column.name === "link_to_discord_message"
+  );
+
+  if (!hasMessageLinkColumn) {
+    await dbRun("ALTER TABLE closed_tickets ADD COLUMN link_to_discord_message TEXT");
+  }
+}
+
 async function initializeDatabase() {
   await dbRun(`
     CREATE TABLE IF NOT EXISTS open_tickets (
@@ -122,9 +148,12 @@ async function initializeDatabase() {
       closed_by TEXT NOT NULL,
       info TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      closed_at TEXT NOT NULL
+      closed_at TEXT NOT NULL,
+      link_to_discord_message TEXT
     )
   `);
+
+  await ensureClosedTicketsSchema();
 }
 
 const CUSTOM_IDS = {
@@ -137,6 +166,13 @@ const CUSTOM_IDS = {
   CREATED_REASON: "created_reason",
   CLOSED_REASON: "closed_reason",
 };
+
+const ticketShowCommand = require("./commands/ticketshow");
+
+const SLASH_COMMANDS = [ticketShowCommand];
+const SLASH_COMMANDS_BY_NAME = new Map(
+  SLASH_COMMANDS.map((command) => [command.data.name, command])
+);
 
 const SQL_INJECTION_PATTERN =
   /(--|\/\*|\*\/|;\s*(drop|alter|truncate|insert|delete|update|select|union|create|grant|revoke)\b|\bunion\s+select\b|\bor\s+1\s*=\s*1|\band\s+1\s*=\s*1)/i;
@@ -459,10 +495,14 @@ async function sendTranscriptToLogs(
     name: transcriptFileName,
   });
 
-  await transcriptLogChannel.send({
+  const sentLogMessage = await transcriptLogChannel.send({
     embeds: [transcriptEmbed],
     files: [transcriptAttachment],
   });
+
+  return sentLogMessage && typeof sentLogMessage.url === "string" && sentLogMessage.url.length > 0
+    ? sentLogMessage.url
+    : null;
 }
 
 async function maybeDmTranscriptToTicketOwner(openTicket, transcriptFileName, transcriptPath) {
@@ -495,6 +535,31 @@ async function maybeDmTranscriptToTicketOwner(openTicket, transcriptFileName, tr
     // If DM delivery fails
     console.log(`Could not DM transcript to user ${openTicket.discord_user_id}. They may have DMs disabled or blocked the bot.`);
   }
+}
+
+async function maybeDeleteTranscriptFile(transcriptPath) {
+  if (!autoDeleteTranscriptsEnabled) {
+    return;
+  }
+
+  try {
+    await fs.promises.unlink(transcriptPath);
+  } catch (error) {
+    if (error && error.code !== "ENOENT") {
+      console.warn(`Failed to auto-delete transcript file: ${transcriptPath}`, error);
+    }
+  }
+}
+
+async function registerSlashCommands() {
+  const commandData = SLASH_COMMANDS.map((command) => command.data.toJSON());
+  const guilds = [...client.guilds.cache.values()];
+
+  for (const guild of guilds) {
+    await guild.commands.set(commandData);
+  }
+
+  console.log(`Registered ${commandData.length} slash command(s) in ${guilds.length} guild(s).`);
 }
 
 async function findExistingOpenTicketForUser(userId) {
@@ -550,7 +615,13 @@ async function memberHasSupportRole(interaction) {
   }
 }
 
-async function moveTicketToClosed(channelId, closedByUserId, infoJson, closedAtIsoTimestamp) {
+async function moveTicketToClosed(
+  channelId,
+  closedByUserId,
+  infoJson,
+  closedAtIsoTimestamp,
+  linkToDiscordMessage = null
+) {
   const openTicket = await getOpenTicketByChannel(channelId);
   if (!openTicket) {
     return null;
@@ -569,9 +640,10 @@ async function moveTicketToClosed(channelId, closedByUserId, infoJson, closedAtI
           closed_by,
           info,
           created_at,
-          closed_at
+          closed_at,
+          link_to_discord_message
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
       [
         openTicket.ticket_id,
@@ -580,6 +652,7 @@ async function moveTicketToClosed(channelId, closedByUserId, infoJson, closedAtI
         infoJson,
         openTicket.created_at,
         closedAt,
+        linkToDiscordMessage,
       ]
     );
 
@@ -736,6 +809,12 @@ client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   try {
+    await registerSlashCommands();
+  } catch (error) {
+    console.error("Failed to register slash commands:", error);
+  }
+
+  try {
     await ensureTicketPanelMessage();
   } catch (error) {
     console.error("Failed to auto-post ticket panel:", error);
@@ -744,6 +823,35 @@ client.once("clientReady", async () => {
 
 client.on("interactionCreate", async (interaction) => {
   try {
+    if (interaction.isChatInputCommand()) {
+      const command = SLASH_COMMANDS_BY_NAME.get(interaction.commandName);
+      if (command) {
+        await command.execute(interaction, {
+          SUPPORT_ROLE_ID,
+          memberHasSupportRole,
+          dbGet,
+          dbAll,
+        });
+        return;
+      }
+    }
+
+    if (
+      interaction.isButton() &&
+      ticketShowCommand.isPaginationButtonCustomId(interaction.customId)
+    ) {
+      const handled = await ticketShowCommand.handlePaginationButton(interaction, {
+        SUPPORT_ROLE_ID,
+        memberHasSupportRole,
+        dbGet,
+        dbAll,
+      });
+
+      if (handled) {
+        return;
+      }
+    }
+
     if (interaction.isButton() && interaction.customId === CUSTOM_IDS.OPEN_TICKET_BUTTON) {
       if (oneOpenTicketPerUserEnabled) {
         const existingTicket = await findExistingOpenTicketForUser(interaction.user.id);
@@ -871,42 +979,47 @@ client.on("interactionCreate", async (interaction) => {
 
       const transcriptResult = await createTicketTranscript(interaction.channel, openTicket);
 
-      await sendTranscriptToLogs(
-        interaction.guild,
-        openTicket,
-        interaction.user.id,
-        closeDetails,
-        transcriptResult.transcriptFileName,
-        transcriptResult.transcriptPath,
-        transcriptResult.closedAt
-      );
+      try {
+        const logMessageUrl = await sendTranscriptToLogs(
+          interaction.guild,
+          openTicket,
+          interaction.user.id,
+          closeDetails,
+          transcriptResult.transcriptFileName,
+          transcriptResult.transcriptPath,
+          transcriptResult.closedAt
+        );
 
-      await maybeDmTranscriptToTicketOwner(
-        openTicket,
-        transcriptResult.transcriptFileName,
-        transcriptResult.transcriptPath
-      );
+        await maybeDmTranscriptToTicketOwner(
+          openTicket,
+          transcriptResult.transcriptFileName,
+          transcriptResult.transcriptPath
+        );
 
-      const closeInfoJson = JSON.stringify(closeDetails);
+        const closeInfoJson = JSON.stringify(closeDetails);
 
-      const closedTicket = await moveTicketToClosed(
-        interaction.channelId,
-        interaction.user.id,
-        closeInfoJson,
-        transcriptResult.closedAt
-      );
+        const closedTicket = await moveTicketToClosed(
+          interaction.channelId,
+          interaction.user.id,
+          closeInfoJson,
+          transcriptResult.closedAt,
+          logMessageUrl
+        );
 
-      if (!closedTicket) {
-        await interaction.editReply("No open ticket record was found for this channel.");
+        if (!closedTicket) {
+          await interaction.editReply("No open ticket record was found for this channel.");
+          return;
+        }
+
+        await interaction.editReply(
+          `Ticket ${closedTicket.ticketId} was closed. Deleting channel now.`
+        );
+
+        await interaction.channel.delete(`Ticket ${closedTicket.ticketId} closed by support staff`);
         return;
+      } finally {
+        await maybeDeleteTranscriptFile(transcriptResult.transcriptPath);
       }
-
-      await interaction.editReply(
-        `Ticket ${closedTicket.ticketId} was closed. Deleting channel now.`
-      );
-
-      await interaction.channel.delete(`Ticket ${closedTicket.ticketId} closed by support staff`);
-      return;
     }
   } catch (error) {
     if (error instanceof ValidationError) {
